@@ -1,4 +1,3 @@
-// ─── alerts.ts ────────────────────────────────────────────────────────────────
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import asyncHandler from 'express-async-handler';
@@ -40,7 +39,6 @@ alertRouter.post(
   asyncHandler(async (req: Request, res: Response) => {
     const body = alertSchema.parse(req.body);
 
-    // Check alert limit per tier
     const limits: Record<string, number> = { PRO: 20, ELITE: 100 };
     const count = await prisma.alert.count({ where: { userId: req.userId!, isActive: true } });
     const limit = limits[req.user!.tier] || 0;
@@ -60,7 +58,7 @@ alertRouter.post(
         companyId,
         ticker: body.ticker?.toUpperCase(),
         type: body.type,
-        condition: body.condition,
+        condition: body.condition as any,  // cast to fix Prisma Json type
         threshold: body.threshold,
         channels: body.channels,
         cooldownMin: body.cooldownMin,

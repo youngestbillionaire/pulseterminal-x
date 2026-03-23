@@ -1,12 +1,24 @@
-import { Queue, Worker, QueueEvents } from 'bullmq';
-import { redis } from '../lib/redis';
+import { Queue, Worker } from 'bullmq';
 import { logger } from '../lib/logger';
 import { prisma } from '../lib/prisma';
 import { intelligenceClient } from '../services/intelligenceClient';
-import { broadcastSignal, broadcastSentimentUpdate } from '../lib/websocket';
+import { broadcastSignal } from '../lib/websocket';
 import cron from 'node-cron';
 
-const connection = { host: process.env.REDIS_HOST || 'localhost', port: 6379 };
+// Parse Redis URL properly for BullMQ (supports rediss:// for TLS)
+function getRedisConnection() {
+  const url = process.env.REDIS_URL || 'redis://localhost:6379';
+  const parsed = new URL(url);
+  return {
+    host: parsed.hostname,
+    port: parseInt(parsed.port) || 6379,
+    password: parsed.password || undefined,
+    username: parsed.username || undefined,
+    tls: url.startsWith('rediss://') ? {} : undefined,
+  };
+}
+
+const connection = getRedisConnection();
 
 // ─── Queue definitions ────────────────────────────────────────────────────────
 export const ingestionQueue = new Queue('ingestion', { connection });
@@ -57,11 +69,9 @@ const signalWorker = new Worker(
   'signals',
   async (job) => {
     const { ticker } = job.data;
-
     const signals = await intelligenceClient.detectSignals(ticker);
 
     for (const sig of signals) {
-      // Upsert signal
       const company = await prisma.company.findUnique({ where: { ticker } });
       if (!company) continue;
 
@@ -78,10 +88,8 @@ const signalWorker = new Worker(
         },
       });
 
-      // Broadcast via WebSocket
       broadcastSignal(ticker, created);
 
-      // Queue alert checks
       await alertQueue.add('check-alerts', { ticker, signalId: created.id }, {
         priority: sig.severity === 'CRITICAL' ? 1 : 5,
       });
@@ -103,20 +111,19 @@ const alertWorker = new Worker(
         type: 'SIGNAL_DETECTED',
         OR: [
           { lastFired: null },
-          { lastFired: { lt: new Date(Date.now() - 3600000) } }, // 1hr cooldown
+          { lastFired: { lt: new Date(Date.now() - 3600000) } },
         ],
       },
       include: { user: { select: { id: true, email: true } } },
     });
 
     for (const alert of activeAlerts) {
-      // Fire alert
       const log = await prisma.alertLog.create({
         data: {
           alertId: alert.id,
           userId: alert.userId,
           message: `Signal detected for ${ticker}`,
-          data: { signalId },
+          data: { signalId } as any,
           channel: 'in_app',
         },
       });
@@ -126,7 +133,6 @@ const alertWorker = new Worker(
         data: { lastFired: new Date() },
       });
 
-      // WebSocket push
       const { broadcastAlertToUser } = await import('../lib/websocket');
       broadcastAlertToUser(alert.userId, { ...log, ticker });
     }
@@ -146,7 +152,6 @@ const alertWorker = new Worker(
 
 // ─── Scheduled jobs via cron ──────────────────────────────────────────────────
 export async function initializeWorkers(): Promise<void> {
-  // Run ingestion for all active watchlisted tickers every 30 minutes
   cron.schedule('*/30 * * * *', async () => {
     logger.info('Starting scheduled ingestion run');
     const tickers = await prisma.company.findMany({
@@ -161,7 +166,6 @@ export async function initializeWorkers(): Promise<void> {
     }
   });
 
-  // Run signal detection every 15 minutes
   cron.schedule('*/15 * * * *', async () => {
     const tickers = await prisma.company.findMany({
       where: { isActive: true },
