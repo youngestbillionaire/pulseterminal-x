@@ -1,0 +1,374 @@
+// This is your Prisma schema file
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── USERS & AUTH ──────────────────────────────────────────────────────────────
+
+model User {
+  id                String    @id @default(cuid())
+  email             String    @unique
+  emailVerified     DateTime?
+  name              String?
+  passwordHash      String?
+  avatarUrl         String?
+  role              UserRole  @default(USER)
+  tier              UserTier  @default(FREE)
+  stripeCustomerId  String?   @unique
+  stripeSubId       String?   @unique
+  subStatus         SubStatus @default(INACTIVE)
+  subPeriodEnd      DateTime?
+  apiKey            String?   @unique @default(cuid())
+  apiCallsToday     Int       @default(0)
+  apiCallsReset     DateTime  @default(now())
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  sessions          Session[]
+  watchlist         WatchlistItem[]
+  alerts            Alert[]
+  alertLogs         AlertLog[]
+  searchHistory     SearchHistory[]
+
+  @@index([email])
+  @@index([stripeCustomerId])
+  @@index([tier])
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([token])
+  @@index([userId])
+}
+
+enum UserRole  { USER ADMIN }
+enum UserTier  { FREE PRO ELITE }
+enum SubStatus { ACTIVE INACTIVE PAST_DUE CANCELED TRIALING }
+
+// ─── FINANCIAL DATA ────────────────────────────────────────────────────────────
+
+model Company {
+  id          String   @id @default(cuid())
+  ticker      String   @unique
+  name        String
+  sector      String?
+  industry    String?
+  exchange    String?
+  logoUrl     String?
+  description String?
+  marketCap   Float?
+  employees   Int?
+  website     String?
+  country     String?  @default("US")
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  earnings      EarningsReport[]
+  sentimentLogs SentimentLog[]
+  signals       Signal[]
+  newsItems     NewsItem[]
+  watchlist     WatchlistItem[]
+  alerts        Alert[]
+  priceHistory  PricePoint[]
+  redditMentions RedditMention[]
+
+  @@index([ticker])
+  @@index([sector])
+  @@index([isActive])
+}
+
+model EarningsReport {
+  id                  String          @id @default(cuid())
+  companyId           String
+  ticker              String
+  fiscalQuarter       String          // e.g. "Q3 2024"
+  fiscalYear          Int
+  quarter             Int             // 1-4
+  reportDate          DateTime
+  reportTime          ReportTime      @default(AMC)
+  epsEstimate         Float?
+  epsActual           Float?
+  epsSurprisePct      Float?
+  revenueEstimate     Float?
+  revenueActual       Float?
+  revenueSurprisePct  Float?
+  guidanceLow         Float?
+  guidanceHigh        Float?
+  guidanceMet         Boolean?
+  callTranscript      String?         @db.Text
+  pressRelease        String?         @db.Text
+  aiInsight           Json?
+  status              EarningsStatus  @default(PENDING)
+  source              String?
+  rawData             Json?
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id])
+
+  @@unique([ticker, fiscalYear, quarter])
+  @@index([ticker])
+  @@index([reportDate])
+  @@index([status])
+  @@index([companyId])
+}
+
+model PricePoint {
+  id        String   @id @default(cuid())
+  companyId String
+  ticker    String
+  timestamp DateTime
+  open      Float
+  high      Float
+  low       Float
+  close     Float
+  volume    BigInt
+  source    String   @default("polygon")
+
+  company Company @relation(fields: [companyId], references: [id])
+
+  @@unique([ticker, timestamp])
+  @@index([ticker, timestamp])
+  @@index([companyId])
+}
+
+enum ReportTime     { BMO DMH AMC }
+enum EarningsStatus { PENDING CONFIRMED REPORTED REVISED }
+
+// ─── ALTERNATIVE DATA ──────────────────────────────────────────────────────────
+
+model SentimentLog {
+  id                  String          @id @default(cuid())
+  companyId           String
+  ticker              String
+  source              SentimentSource
+  score               Float           // -1.0 to 1.0
+  magnitude           Float           // 0.0 to 1.0 (confidence)
+  bullishCount        Int             @default(0)
+  bearishCount        Int             @default(0)
+  neutralCount        Int             @default(0)
+  mentionCount        Int             @default(0)
+  velocityScore       Float?          // rate of change
+  windowHours         Int             @default(24)
+  recordedAt          DateTime
+  createdAt           DateTime        @default(now())
+
+  company Company @relation(fields: [companyId], references: [id])
+
+  @@index([ticker, recordedAt])
+  @@index([companyId])
+  @@index([source])
+  @@index([score])
+}
+
+model RedditMention {
+  id          String   @id @default(cuid())
+  companyId   String
+  ticker      String
+  subreddit   String
+  postId      String   @unique
+  title       String
+  body        String?  @db.Text
+  score       Int      @default(0)
+  numComments Int      @default(0)
+  sentiment   Float?
+  url         String
+  author      String?
+  createdAt   DateTime
+  fetchedAt   DateTime @default(now())
+
+  company Company @relation(fields: [companyId], references: [id])
+
+  @@index([ticker, createdAt])
+  @@index([subreddit])
+}
+
+model NewsItem {
+  id          String    @id @default(cuid())
+  companyId   String?
+  ticker      String?
+  headline    String
+  summary     String?   @db.Text
+  content     String?   @db.Text
+  source      String
+  url         String    @unique
+  author      String?
+  imageUrl    String?
+  sentiment   Float?
+  relevance   Float?
+  category    String?
+  publishedAt DateTime
+  fetchedAt   DateTime  @default(now())
+  tags        String[]
+
+  company Company? @relation(fields: [companyId], references: [id])
+
+  @@index([ticker, publishedAt])
+  @@index([publishedAt])
+  @@index([source])
+}
+
+enum SentimentSource { REDDIT TWITTER NEWS COMBINED }
+
+// ─── SIGNALS ───────────────────────────────────────────────────────────────────
+
+model Signal {
+  id          String       @id @default(cuid())
+  companyId   String
+  ticker      String
+  type        SignalType
+  severity    SignalSeverity
+  title       String
+  description String
+  data        Json?
+  score       Float        // 0-100 strength score
+  isActive    Boolean      @default(true)
+  expiresAt   DateTime?
+  detectedAt  DateTime     @default(now())
+  createdAt   DateTime     @default(now())
+
+  company Company @relation(fields: [companyId], references: [id])
+
+  @@index([ticker, detectedAt])
+  @@index([type])
+  @@index([severity])
+  @@index([isActive])
+}
+
+enum SignalType {
+  MENTION_SPIKE
+  SENTIMENT_REVERSAL
+  UNUSUAL_VOLUME
+  EARNINGS_BEAT
+  EARNINGS_MISS
+  GUIDANCE_RAISE
+  GUIDANCE_CUT
+  INSTITUTIONAL_ACTIVITY
+  INSIDER_TRADE
+  ANALYST_UPGRADE
+  ANALYST_DOWNGRADE
+  PRICE_ANOMALY
+}
+
+enum SignalSeverity { LOW MEDIUM HIGH CRITICAL }
+
+// ─── USER FEATURES ─────────────────────────────────────────────────────────────
+
+model WatchlistItem {
+  id        String   @id @default(cuid())
+  userId    String
+  companyId String
+  ticker    String
+  addedAt   DateTime @default(now())
+  notes     String?
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  company Company @relation(fields: [companyId], references: [id])
+
+  @@unique([userId, ticker])
+  @@index([userId])
+}
+
+model Alert {
+  id          String      @id @default(cuid())
+  userId      String
+  companyId   String?
+  ticker      String?
+  type        AlertType
+  condition   Json        // structured condition object
+  threshold   Float?
+  isActive    Boolean     @default(true)
+  lastFired   DateTime?
+  cooldownMin Int         @default(60)
+  channels    String[]    @default(["in_app"])
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  company Company? @relation(fields: [companyId], references: [id])
+  logs    AlertLog[]
+
+  @@index([userId])
+  @@index([ticker])
+  @@index([isActive])
+}
+
+model AlertLog {
+  id        String   @id @default(cuid())
+  alertId   String
+  userId    String
+  message   String
+  data      Json?
+  channel   String
+  sentAt    DateTime @default(now())
+
+  alert Alert @relation(fields: [alertId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id])
+
+  @@index([alertId])
+  @@index([userId])
+}
+
+model SearchHistory {
+  id        String   @id @default(cuid())
+  userId    String
+  query     String
+  type      String   @default("ticker")
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+enum AlertType {
+  PRICE_TARGET
+  EARNINGS_RELEASE
+  SENTIMENT_THRESHOLD
+  SIGNAL_DETECTED
+  VOLUME_SPIKE
+}
+
+// ─── SYSTEM ────────────────────────────────────────────────────────────────────
+
+model JobLog {
+  id        String    @id @default(cuid())
+  jobName   String
+  status    JobStatus
+  duration  Int?      // ms
+  error     String?   @db.Text
+  metadata  Json?
+  startedAt DateTime  @default(now())
+  endedAt   DateTime?
+
+  @@index([jobName, startedAt])
+  @@index([status])
+}
+
+model RateLimitLog {
+  id        String   @id @default(cuid())
+  key       String
+  count     Int      @default(1)
+  window    DateTime
+  createdAt DateTime @default(now())
+
+  @@unique([key, window])
+  @@index([key])
+}
+
+enum JobStatus { RUNNING SUCCESS FAILED SKIPPED }
