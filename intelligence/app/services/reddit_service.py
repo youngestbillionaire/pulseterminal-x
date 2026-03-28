@@ -1,15 +1,17 @@
 """
-Reddit ingestion using PRAW with async-friendly wrapper and fallback scraping.
+Reddit ingestion using pure HTTP scraping — zero API key required.
+Uses Reddit's public JSON endpoints and old.reddit.com search.
 """
 from __future__ import annotations
 import asyncio
+import hashlib
 import re
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List
 import structlog
+import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from app.config import settings
 from app.services.sentiment_service import sentiment_analyzer
 from app.utils.database import get_session
 from app.utils.redis_client import redis_client
@@ -19,124 +21,190 @@ logger = structlog.get_logger()
 FINANCIAL_SUBREDDITS = [
     "wallstreetbets", "stocks", "investing", "stockmarket",
     "SecurityAnalysis", "options", "Daytrading", "dividends",
-    "ValueInvesting", "pennystocks",
+    "ValueInvesting", "pennystocks", "StockMarket", "finance",
 ]
 
-MENTION_PATTERN_TEMPLATE = r'\b{ticker}\b'
+# Rotate user agents to avoid blocks
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+]
+
+def _get_headers(index: int = 0) -> dict:
+    return {
+        "User-Agent": USER_AGENTS[index % len(USER_AGENTS)],
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
 
 
-class RedditIngestionService:
-    def __init__(self):
-        self._reddit = None
+class RedditScraperService:
+    """
+    Scrapes Reddit for stock mentions without any API key.
+    Uses two strategies:
+      1. Reddit search JSON API (public, no auth)
+      2. Per-subreddit new posts JSON endpoint
+    """
 
-    def _get_reddit(self):
-        if self._reddit is None:
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=3, max=15))
+    async def _search_reddit(self, ticker: str, timeframe: str = "day") -> List[dict]:
+        """Use Reddit's public search JSON endpoint."""
+        queries = [
+            f"${ticker}",
+            f"{ticker} stock",
+            f"{ticker} earnings",
+        ]
+        posts = []
+        seen_ids = set()
+
+        async with httpx.AsyncClient(
+            headers=_get_headers(0),
+            follow_redirects=True,
+            timeout=15,
+        ) as client:
+            for i, query in enumerate(queries):
+                try:
+                    url = (
+                        f"https://www.reddit.com/search.json"
+                        f"?q={query}&sort=new&t={timeframe}&limit=25&type=link"
+                    )
+                    resp = await client.get(url)
+                    if resp.status_code != 200:
+                        continue
+
+                    data = resp.json()
+                    children = data.get("data", {}).get("children", [])
+
+                    for child in children:
+                        p = child.get("data", {})
+                        post_id = p.get("id", "")
+                        if not post_id or post_id in seen_ids:
+                            continue
+                        seen_ids.add(post_id)
+
+                        # Filter for finance-related subreddits
+                        subreddit = p.get("subreddit", "").lower()
+                        if not any(s in subreddit for s in ["stock", "invest", "finance", "wsb", "wallstreet", "option", "trading", "dividend", "market", "security"]):
+                            # Still include if it directly mentions the ticker
+                            title = p.get("title", "")
+                            if f"${ticker.upper()}" not in title.upper() and f" {ticker.upper()} " not in f" {title.upper()} ":
+                                continue
+
+                        posts.append(self._parse_post(p))
+
+                    # Small delay between queries
+                    await asyncio.sleep(1)
+
+                except Exception as e:
+                    logger.warning("Reddit search query failed", query=query, error=str(e))
+                    continue
+
+        return posts
+
+    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=2, max=8))
+    async def _scrape_subreddit(self, subreddit: str, ticker: str) -> List[dict]:
+        """Scrape new posts from a specific subreddit and filter by ticker mention."""
+        pattern = re.compile(
+            r'(?<![A-Z\$])(\$?' + re.escape(ticker.upper()) + r')(?![A-Z])',
+            re.IGNORECASE
+        )
+        posts = []
+
+        async with httpx.AsyncClient(
+            headers=_get_headers(1),
+            follow_redirects=True,
+            timeout=12,
+        ) as client:
             try:
-                import praw
-                self._reddit = praw.Reddit(
-                    client_id=settings.REDDIT_CLIENT_ID,
-                    client_secret=settings.REDDIT_CLIENT_SECRET,
-                    user_agent=settings.REDDIT_USER_AGENT,
-                    read_only=True,
-                )
-                logger.info("PRAW Reddit client initialized")
-            except Exception as e:
-                logger.error("PRAW init failed", error=str(e))
-                self._reddit = None
-        return self._reddit
+                url = f"https://www.reddit.com/r/{subreddit}/new.json?limit=50"
+                resp = await client.get(url)
+                if resp.status_code != 200:
+                    return []
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    async def fetch_mentions(self, ticker: str, hours: int = 24) -> List[dict]:
-        """Fetch Reddit posts mentioning ticker from the last N hours."""
-        rate_key = f"ratelimit:reddit:{ticker}"
-        # Basic rate limiting: 1 call per ticker per 10 minutes
+                data = resp.json()
+                children = data.get("data", {}).get("children", [])
+
+                for child in children:
+                    p = child.get("data", {})
+                    text = f"{p.get('title', '')} {p.get('selftext', '')}"
+                    if pattern.search(text):
+                        posts.append(self._parse_post(p))
+
+            except Exception as e:
+                logger.warning("Subreddit scrape failed", subreddit=subreddit, error=str(e))
+
+        return posts
+
+    def _parse_post(self, p: dict) -> dict:
+        created_utc = p.get("created_utc", 0)
+        try:
+            created_at = datetime.fromtimestamp(created_utc, tz=timezone.utc).isoformat()
+        except Exception:
+            created_at = datetime.now(timezone.utc).isoformat()
+
+        return {
+            "post_id": p.get("id", hashlib.md5(p.get("url", "").encode()).hexdigest()[:8]),
+            "subreddit": p.get("subreddit", "unknown"),
+            "title": (p.get("title") or "")[:500],
+            "body": (p.get("selftext") or "")[:2000],
+            "score": int(p.get("score") or 0),
+            "num_comments": int(p.get("num_comments") or 0),
+            "url": f"https://reddit.com{p.get('permalink', '')}" if p.get("permalink") else p.get("url", ""),
+            "author": p.get("author", "[deleted]"),
+            "created_at": created_at,
+        }
+
+    def _deduplicate(self, posts: List[dict]) -> List[dict]:
+        seen = set()
+        unique = []
+        for p in posts:
+            if p["post_id"] not in seen:
+                seen.add(p["post_id"])
+                unique.append(p)
+        return unique
+
+    async def fetch_mentions(self, ticker: str) -> List[dict]:
+        """
+        Main fetch method — runs search + top subreddit scrapes concurrently.
+        No API key needed.
+        """
+        # Rate limit: 1 full scrape per ticker per 10 minutes
+        rate_key = f"ratelimit:reddit_scrape:{ticker.upper()}"
         if await redis_client.exists(rate_key):
-            logger.debug("Reddit rate limit hit, returning cached", ticker=ticker)
+            logger.debug("Reddit scrape rate limited", ticker=ticker)
             return []
         await redis_client.setex(rate_key, 600, "1")
 
-        loop = asyncio.get_event_loop()
-        try:
-            mentions = await loop.run_in_executor(
-                None, self._fetch_sync, ticker, hours
-            )
-            return mentions
-        except Exception as e:
-            logger.error("Reddit fetch failed", ticker=ticker, error=str(e))
-            return await self._scrape_fallback(ticker)
+        # Run search + top 4 subreddits concurrently
+        tasks = [
+            self._search_reddit(ticker),
+            self._scrape_subreddit("wallstreetbets", ticker),
+            self._scrape_subreddit("stocks", ticker),
+            self._scrape_subreddit("investing", ticker),
+            self._scrape_subreddit("stockmarket", ticker),
+        ]
 
-    def _fetch_sync(self, ticker: str, hours: int) -> List[dict]:
-        reddit = self._get_reddit()
-        if not reddit:
-            return []
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        pattern = re.compile(MENTION_PATTERN_TEMPLATE.format(ticker=re.escape(ticker)), re.IGNORECASE)
-        mentions = []
-        cutoff_ts = datetime.now(timezone.utc).timestamp() - (hours * 3600)
+        all_posts = []
+        for r in results:
+            if isinstance(r, list):
+                all_posts.extend(r)
+            elif isinstance(r, Exception):
+                logger.warning("Reddit task failed", error=str(r))
 
-        for subreddit_name in FINANCIAL_SUBREDDITS[:5]:  # Limit subreddits per call
-            try:
-                subreddit = reddit.subreddit(subreddit_name)
-                for post in subreddit.new(limit=100):
-                    if post.created_utc < cutoff_ts:
-                        continue
-                    text = f"{post.title} {post.selftext or ''}"
-                    if pattern.search(text):
-                        mentions.append({
-                            "post_id": post.id,
-                            "subreddit": subreddit_name,
-                            "title": post.title[:500],
-                            "body": (post.selftext or "")[:2000],
-                            "score": post.score,
-                            "num_comments": post.num_comments,
-                            "url": f"https://reddit.com{post.permalink}",
-                            "author": str(post.author) if post.author else "[deleted]",
-                            "created_at": datetime.fromtimestamp(post.created_utc, tz=timezone.utc).isoformat(),
-                        })
-            except Exception as e:
-                logger.warning("Subreddit fetch failed", subreddit=subreddit_name, error=str(e))
-                continue
-
-        return mentions
-
-    async def _scrape_fallback(self, ticker: str) -> List[dict]:
-        """Fallback: scrape Reddit search via JSON API."""
-        import httpx
-        try:
-            url = f"https://www.reddit.com/search.json?q={ticker}+stock&sort=new&limit=25&t=day"
-            async with httpx.AsyncClient(headers={"User-Agent": settings.REDDIT_USER_AGENT}) as client:
-                resp = await client.get(url, timeout=10)
-                data = resp.json()
-
-            posts = data.get("data", {}).get("children", [])
-            return [
-                {
-                    "post_id": p["data"]["id"],
-                    "subreddit": p["data"]["subreddit"],
-                    "title": p["data"]["title"][:500],
-                    "body": (p["data"].get("selftext") or "")[:2000],
-                    "score": p["data"]["score"],
-                    "num_comments": p["data"]["num_comments"],
-                    "url": f"https://reddit.com{p['data']['permalink']}",
-                    "author": p["data"].get("author", "[deleted]"),
-                    "created_at": datetime.fromtimestamp(
-                        p["data"]["created_utc"], tz=timezone.utc
-                    ).isoformat(),
-                }
-                for p in posts
-                if isinstance(p.get("data"), dict)
-            ]
-        except Exception as e:
-            logger.error("Reddit scrape fallback failed", ticker=ticker, error=str(e))
-            return []
+        deduped = self._deduplicate(all_posts)
+        logger.info("Reddit scrape complete", ticker=ticker, raw=len(all_posts), unique=len(deduped))
+        return deduped
 
     async def ingest_and_analyze(self, ticker: str) -> dict:
-        """Full pipeline: fetch → analyze sentiment → store."""
+        """Full pipeline: scrape → sentiment → store."""
         mentions = await self.fetch_mentions(ticker)
         if not mentions:
             return {"ticker": ticker, "count": 0, "sentiment": None}
 
-        # Analyze sentiment on titles + body snippets
+        # Analyze sentiment
         texts = [f"{m['title']}. {m['body'][:200]}" for m in mentions]
         scored = await sentiment_analyzer.analyze_batch(texts)
 
@@ -145,67 +213,73 @@ class RedditIngestionService:
 
         aggregate = sentiment_analyzer.aggregate_sentiment(scored)
 
-        # Persist to DB via SQLAlchemy
+        # Persist
         async with get_session() as session:
             from sqlalchemy import text
-            # Upsert reddit mentions
+
             for m in mentions:
+                try:
+                    await session.execute(
+                        text("""
+                            INSERT INTO "RedditMention"
+                                (id, "companyId", ticker, subreddit, "postId", title, body,
+                                 score, "numComments", sentiment, url, author, "createdAt", "fetchedAt")
+                            SELECT
+                                gen_random_uuid(), c.id, :ticker, :subreddit, :post_id, :title,
+                                :body, :score, :num_comments, :sentiment, :url, :author,
+                                :created_at::timestamptz, NOW()
+                            FROM "Company" c WHERE c.ticker = :ticker
+                            ON CONFLICT ("postId") DO UPDATE
+                                SET score = EXCLUDED.score,
+                                    "numComments" = EXCLUDED."numComments",
+                                    sentiment = EXCLUDED.sentiment
+                        """),
+                        {
+                            "ticker": ticker.upper(),
+                            "subreddit": m["subreddit"],
+                            "post_id": m["post_id"],
+                            "title": m["title"],
+                            "body": m.get("body", ""),
+                            "score": m["score"],
+                            "num_comments": m["num_comments"],
+                            "sentiment": m.get("sentiment"),
+                            "url": m["url"][:1000],
+                            "author": m.get("author", "")[:200],
+                            "created_at": m["created_at"],
+                        }
+                    )
+                except Exception as e:
+                    logger.warning("Reddit mention insert failed", post_id=m.get("post_id"), error=str(e))
+
+            # Log aggregate sentiment
+            try:
                 await session.execute(
                     text("""
-                        INSERT INTO "RedditMention"
-                            (id, "companyId", ticker, subreddit, "postId", title, body,
-                             score, "numComments", sentiment, url, author, "createdAt", "fetchedAt")
+                        INSERT INTO "SentimentLog"
+                            (id, "companyId", ticker, source, score, magnitude,
+                             "bullishCount", "bearishCount", "neutralCount", "mentionCount",
+                             "windowHours", "recordedAt", "createdAt")
                         SELECT
-                            gen_random_uuid(), c.id, :ticker, :subreddit, :post_id, :title,
-                            :body, :score, :num_comments, :sentiment, :url, :author,
-                            :created_at::timestamptz, NOW()
+                            gen_random_uuid(), c.id, :ticker, 'REDDIT',
+                            :score, :magnitude, :bullish, :bearish, :neutral, :mentions,
+                            24, NOW(), NOW()
                         FROM "Company" c WHERE c.ticker = :ticker
-                        ON CONFLICT ("postId") DO UPDATE
-                            SET score = EXCLUDED.score,
-                                "numComments" = EXCLUDED."numComments",
-                                sentiment = EXCLUDED.sentiment
                     """),
                     {
                         "ticker": ticker.upper(),
-                        "subreddit": m["subreddit"],
-                        "post_id": m["post_id"],
-                        "title": m["title"],
-                        "body": m.get("body", ""),
-                        "score": m["score"],
-                        "num_comments": m["num_comments"],
-                        "sentiment": m.get("sentiment"),
-                        "url": m["url"],
-                        "author": m.get("author", ""),
-                        "created_at": m["created_at"],
+                        "score": aggregate["score"],
+                        "magnitude": aggregate["magnitude"],
+                        "bullish": aggregate["bullish_count"],
+                        "bearish": aggregate["bearish_count"],
+                        "neutral": aggregate["neutral_count"],
+                        "mentions": aggregate["mention_count"],
                     }
                 )
+            except Exception as e:
+                logger.warning("Sentiment log insert failed", ticker=ticker, error=str(e))
 
-            # Log aggregate sentiment
-            await session.execute(
-                text("""
-                    INSERT INTO "SentimentLog"
-                        (id, "companyId", ticker, source, score, magnitude,
-                         "bullishCount", "bearishCount", "neutralCount", "mentionCount",
-                         "windowHours", "recordedAt", "createdAt")
-                    SELECT
-                        gen_random_uuid(), c.id, :ticker, 'REDDIT',
-                        :score, :magnitude, :bullish, :bearish, :neutral, :mentions,
-                        24, NOW(), NOW()
-                    FROM "Company" c WHERE c.ticker = :ticker
-                """),
-                {
-                    "ticker": ticker.upper(),
-                    "score": aggregate["score"],
-                    "magnitude": aggregate["magnitude"],
-                    "bullish": aggregate["bullish_count"],
-                    "bearish": aggregate["bearish_count"],
-                    "neutral": aggregate["neutral_count"],
-                    "mentions": aggregate["mention_count"],
-                }
-            )
             await session.commit()
 
-        logger.info("Reddit ingestion complete", ticker=ticker, count=len(mentions))
         return {
             "ticker": ticker,
             "count": len(mentions),
@@ -214,4 +288,4 @@ class RedditIngestionService:
         }
 
 
-reddit_service = RedditIngestionService()
+reddit_service = RedditScraperService()

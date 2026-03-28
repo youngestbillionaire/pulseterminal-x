@@ -23,7 +23,7 @@ earningsRouter.get(
 
     const cacheKey = CacheKeys.earningsCalendar(`${startDate.toISOString()}-${weeksAhead}`);
     const cached = await cacheGet<any>(cacheKey);
-    if (cached) return res.json(cached);
+    if (cached) { res.json(cached); return; }
 
     const earnings = await prisma.earningsReport.findMany({
       where: {
@@ -38,7 +38,6 @@ earningsRouter.get(
       orderBy: [{ reportDate: 'asc' }, { company: { marketCap: 'desc' } }],
     });
 
-    // Group by date
     const grouped: Record<string, any[]> = {};
     for (const e of earnings) {
       const key = e.reportDate.toISOString().split('T')[0];
@@ -47,7 +46,7 @@ earningsRouter.get(
     }
 
     const result = { calendar: grouped, total: earnings.length };
-    await cacheSet(cacheKey, result, 900); // 15 min
+    await cacheSet(cacheKey, result, 900);
     res.json(result);
   })
 );
@@ -62,7 +61,7 @@ earningsRouter.get(
 
     const cacheKey = CacheKeys.earnings(ticker);
     const cached = await cacheGet<any>(cacheKey);
-    if (cached) return res.json(cached);
+    if (cached) { res.json(cached); return; }
 
     const earnings = await prisma.earningsReport.findMany({
       where: { ticker },
@@ -114,15 +113,13 @@ earningsRouter.get(
 
     if (!report) throw new NotFoundError('Earnings report');
 
-    // Return cached insight or generate new one
     if (report.aiInsight) {
-      return res.json({ insight: report.aiInsight, cached: true });
+      res.json({ insight: report.aiInsight, cached: true });
+      return;
     }
 
-    // Request insight generation from Python intelligence service
     const insight = await intelligenceClient.generateEarningsInsight(reportId);
 
-    // Cache it on the report
     await prisma.earningsReport.update({
       where: { id: reportId },
       data: { aiInsight: insight },
@@ -132,7 +129,7 @@ earningsRouter.get(
   })
 );
 
-// ─── POST /api/earnings/:ticker/upcoming ──────────────────────────────────────
+// ─── GET /api/earnings/:ticker/upcoming ───────────────────────────────────────
 earningsRouter.get(
   '/:ticker/upcoming',
   authenticate,

@@ -14,7 +14,7 @@ watchlistRouter.get(
   asyncHandler(async (req: Request, res: Response) => {
     const cacheKey = CacheKeys.userWatchlist(req.userId!);
     const cached = await cacheGet<any>(cacheKey);
-    if (cached) return res.json(cached);
+    if (cached) { res.json(cached); return; }
 
     const items = await prisma.watchlistItem.findMany({
       where: { userId: req.userId! },
@@ -28,7 +28,6 @@ watchlistRouter.get(
       orderBy: { addedAt: 'desc' },
     });
 
-    // Enrich with latest signal and sentiment
     const enriched = await Promise.all(
       items.map(async (item) => {
         const [latestSignal, latestSentiment] = await Promise.all([
@@ -62,7 +61,6 @@ watchlistRouter.post(
       notes: z.string().max(500).optional(),
     }).parse(req.body);
 
-    // Check limits
     const count = await prisma.watchlistItem.count({ where: { userId: req.userId! } });
     const limits: Record<string, number> = { FREE: 5, PRO: 50, ELITE: 500 };
     const limit = limits[req.user!.tier] || 5;

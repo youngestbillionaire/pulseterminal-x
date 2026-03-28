@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import asyncHandler from 'express-async-handler';
 import { prisma } from '../lib/prisma';
-import { authenticate, requireTier } from '../middleware/auth';
+import { authenticate } from '../middleware/auth';
 import { cacheGet, cacheSet, CacheKeys } from '../lib/redis';
 
 export const signalRouter = Router();
@@ -62,7 +62,7 @@ signalRouter.get(
   authenticate,
   asyncHandler(async (_req: Request, res: Response) => {
     const cached = await cacheGet<any>('signals:top');
-    if (cached) return res.json(cached);
+    if (cached) { res.json(cached); return; }
 
     const signals = await prisma.signal.findMany({
       where: {
@@ -78,7 +78,7 @@ signalRouter.get(
     });
 
     const result = { signals };
-    await cacheSet('signals:top', result, 60); // 1 min cache
+    await cacheSet('signals:top', result, 60);
     res.json(result);
   })
 );
@@ -91,7 +91,7 @@ signalRouter.get(
     const ticker = req.params.ticker.toUpperCase();
     const cacheKey = CacheKeys.signals(ticker);
     const cached = await cacheGet<any>(cacheKey);
-    if (cached) return res.json(cached);
+    if (cached) { res.json(cached); return; }
 
     const signals = await prisma.signal.findMany({
       where: {

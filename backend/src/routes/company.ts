@@ -32,7 +32,6 @@ companyRouter.get(
       orderBy: [{ marketCap: 'desc' }],
     });
 
-    // Log search history
     if (req.userId) {
       prisma.searchHistory.create({
         data: { userId: req.userId, query: q, type: 'company' },
@@ -49,9 +48,8 @@ companyRouter.get(
   authenticate,
   asyncHandler(async (_req: Request, res: Response) => {
     const cached = await cacheGet<any[]>(CacheKeys.trending());
-    if (cached) return res.json({ tickers: cached });
+    if (cached) { res.json({ tickers: cached }); return; }
 
-    // Aggregate by recent signal count + sentiment velocity
     const trending = await prisma.$queryRaw<any[]>`
       SELECT c.ticker, c.name, c."logoUrl", c.sector,
              COUNT(DISTINCT s.id) as signal_count,
@@ -67,7 +65,7 @@ companyRouter.get(
       LIMIT 20
     `;
 
-    await cacheSet(CacheKeys.trending(), trending, 300); // 5 min cache
+    await cacheSet(CacheKeys.trending(), trending, 300);
     res.json({ tickers: trending });
   })
 );
@@ -79,7 +77,7 @@ companyRouter.get(
   asyncHandler(async (req: Request, res: Response) => {
     const ticker = req.params.ticker.toUpperCase();
     const cached = await cacheGet<any>(CacheKeys.company(ticker));
-    if (cached) return res.json(cached);
+    if (cached) { res.json(cached); return; }
 
     const company = await prisma.company.findUnique({
       where: { ticker },
